@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Limit Order Book Simulator"
+description = "A single-page trading simulator for exploring limit order book behavior with price-time priority, market sweeps, cancellations, seeded liquidity, and a live trade tape."
+version = "1.0.0"
+id = "artifacts/limit-order-book"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 21239
+
+[services.development]
+run = "pnpm --filter @workspace/limit-order-book run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/limit-order-book", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/limit-order-book/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "21239"
+BASE_PATH = "/"
