@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   ArrowDownToLine,
@@ -9,6 +9,7 @@ import {
   CircleHelp,
   Clock3,
   Layers3,
+  Pause,
   Play,
   RotateCcw,
   ShieldCheck,
@@ -183,6 +184,192 @@ function seedBook(): BookState {
   return seeded;
 }
 
+function getBookTop(book: BookState) {
+  const bestBid = book.bids.length ? Math.max(...book.bids.map((order) => order.price)) : undefined;
+  const bestAsk = book.asks.length ? Math.min(...book.asks.map((order) => order.price)) : undefined;
+  return {
+    bestBid,
+    bestAsk,
+    spread: bestBid !== undefined && bestAsk !== undefined ? bestAsk - bestBid : undefined,
+    midpoint: bestBid !== undefined && bestAsk !== undefined ? (bestAsk + bestBid) / 2 : undefined,
+  };
+}
+
+function randomQuantity(min: number, max: number) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+function ensureLiquidity(book: BookState): BookState {
+  let next = book;
+  let { bestBid, bestAsk } = getBookTop(next);
+  if (!next.bids.length) {
+    const anchor = bestAsk ?? 100;
+    for (let level = 1; level <= 8; level += 1) {
+      const result = addLimitOrder(next, 'buy', Number((anchor - level * 0.01).toFixed(2)), randomQuantity(10, 300));
+      next = result.book;
+    }
+    bestBid = getBookTop(next).bestBid;
+  }
+  if (!next.asks.length) {
+    const anchor = bestBid ?? 100;
+    for (let level = 1; level <= 8; level += 1) {
+      const result = addLimitOrder(next, 'sell', Number((anchor + level * 0.01).toFixed(2)), randomQuantity(10, 300));
+      next = result.book;
+    }
+  }
+  return next;
+}
+
+function randomLimitPrice(book: BookState, side: Side) {
+  const { bestBid, bestAsk } = getBookTop(book);
+  const reference = side === 'buy'
+    ? bestBid ?? (bestAsk !== undefined ? bestAsk - 0.01 : 100)
+    : bestAsk ?? (bestBid !== undefined ? bestBid + 0.01 : 100);
+  const nearTouch = Math.random() < 0.86;
+  const offset = nearTouch
+    ? Math.floor(Math.random() * 9) - 4
+    : (Math.floor(Math.random() * 15) + 6) * (Math.random() < 0.5 ? -1 : 1);
+  return Number(Math.max(0.01, reference + offset * 0.01).toFixed(2));
+}
+
+function PriceChart({ prices }: { prices: number[] }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const bounds = canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.max(1, Math.floor(bounds.width * dpr));
+    canvas.height = Math.max(1, Math.floor(bounds.height * dpr));
+    const context = canvas.getContext('2d');
+    if (!context) return;
+    context.scale(dpr, dpr);
+    const width = bounds.width;
+    const height = bounds.height;
+    const padding = { top: 12, right: 14, bottom: 17, left: 14 };
+    const plotWidth = width - padding.left - padding.right;
+    const plotHeight = height - padding.top - padding.bottom;
+    context.clearRect(0, 0, width, height);
+
+    context.strokeStyle = 'hsl(220 19% 18% / .65)';
+    context.lineWidth = 1;
+    for (let row = 1; row <= 2; row += 1) {
+      const y = padding.top + (plotHeight * row) / 3;
+      context.beginPath();
+      context.moveTo(padding.left, y);
+      context.lineTo(width - padding.right, y);
+      context.stroke();
+    }
+
+    if (prices.length < 2) {
+      context.fillStyle = 'hsl(216 13% 57%)';
+      context.font = '10px "DM Mono", monospace';
+      context.fillText('Trade prices will plot here', padding.left, height / 2);
+      return;
+    }
+
+    const minimum = Math.min(...prices);
+    const maximum = Math.max(...prices);
+    const range = Math.max(maximum - minimum, 0.01);
+    const xFor = (index: number) => padding.left + (index / (prices.length - 1)) * plotWidth;
+    const yFor = (price: number) => padding.top + ((maximum - price) / range) * plotHeight;
+
+    context.beginPath();
+    prices.forEach((price, index) => {
+      const x = xFor(index);
+      const y = yFor(price);
+      if (index === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    });
+    context.strokeStyle = 'hsl(183 86% 54%)';
+    context.lineWidth = 1.6;
+    context.shadowColor = 'hsl(183 86% 54% / .35)';
+    context.shadowBlur = 7;
+    context.stroke();
+    context.shadowBlur = 0;
+
+    const lastX = xFor(prices.length - 1);
+    const lastY = yFor(prices[prices.length - 1]);
+    context.fillStyle = 'hsl(183 86% 54%)';
+    context.beginPath();
+    context.arc(lastX, lastY, 2.5, 0, Math.PI * 2);
+    context.fill();
+    context.font = '9px "DM Mono", monospace';
+    context.fillStyle = 'hsl(210 24% 91%)';
+    context.fillText(money(maximum), width - padding.right - 42, padding.top - 2);
+    context.fillStyle = 'hsl(216 13% 57%)';
+    context.fillText(money(minimum), width - padding.right - 42, height - 3);
+  }, [prices]);
+
+  return (
+    <div className="price-chart" aria-label="Last 200 trade prices">
+      <div className="chart-label"><span>trade price / last 200</span><span className="mono">{prices.length ? money(prices[prices.length - 1]) : '—'}</span></div>
+      <canvas ref={canvasRef} role="img" aria-label="Trade price line chart" />
+    </div>
+  );
+}
+
+function MetricsStrip({ book }: { book: BookState }) {
+  const { bestBid, bestAsk, spread, midpoint } = getBookTop(book);
+  const bidSize = book.bids.reduce((total, order) => total + order.quantity, 0);
+  const askSize = book.asks.reduce((total, order) => total + order.quantity, 0);
+  const totalSize = bidSize + askSize;
+  const imbalance = totalSize ? (bidSize / totalSize) * 100 : 50;
+  const volume = book.trades.reduce((total, trade) => total + trade.quantity, 0);
+  const vwap = volume ? book.trades.reduce((total, trade) => total + trade.price * trade.quantity, 0) / volume : undefined;
+  const lastTrade = book.trades[0];
+  const previousTrade = book.trades[1];
+  const lastDelta = lastTrade && previousTrade ? lastTrade.price - previousTrade.price : 0;
+
+  return (
+    <section className="metrics-strip panel" aria-label="Live market metrics">
+      <div className="metric"><span className="metric-label">best bid</span><strong className="metric-value bid-text">{bestBid !== undefined ? money(bestBid) : '—'}</strong></div>
+      <div className="metric"><span className="metric-label">best ask</span><strong className="metric-value ask-text">{bestAsk !== undefined ? money(bestAsk) : '—'}</strong></div>
+      <div className="metric"><span className="metric-label">spread / ticks</span><strong className="metric-value">{spread !== undefined ? `${money(spread)} · ${Math.round(spread / 0.01)}t` : '—'}</strong></div>
+      <div className="metric"><span className="metric-label">mid price</span><strong className="metric-value">{midpoint !== undefined ? money(midpoint) : '—'}</strong></div>
+      <div className="metric imbalance-metric">
+        <div className="metric-label-row"><span className="metric-label">book imbalance</span><strong className="metric-value">{imbalance.toFixed(0)}% bid</strong></div>
+        <div className="imbalance-bar" aria-label={`${imbalance.toFixed(0)} percent bid imbalance`}><span style={{ width: `${imbalance}%` }} /></div>
+      </div>
+      <div className="metric"><span className="metric-label">trades</span><strong className="metric-value">{book.trades.length}</strong></div>
+      <div className="metric"><span className="metric-label">volume</span><strong className="metric-value">{quantityText(volume)}</strong></div>
+      <div className="metric"><span className="metric-label">vwap</span><strong className="metric-value">{vwap !== undefined ? money(vwap) : '—'}</strong></div>
+      <div className="metric"><span className="metric-label">last trade</span><strong className={`metric-value ${lastDelta > 0 ? 'bid-text' : lastDelta < 0 ? 'ask-text' : ''}`}>{lastTrade ? money(lastTrade.price) : '—'}</strong></div>
+    </section>
+  );
+}
+
+function FlowControls({
+  running,
+  speed,
+  aggression,
+  onRunningChange,
+  onSpeedChange,
+  onAggressionChange,
+  onBigMarket,
+}: {
+  running: boolean;
+  speed: number;
+  aggression: number;
+  onRunningChange: (running: boolean) => void;
+  onSpeedChange: (speed: number) => void;
+  onAggressionChange: (aggression: number) => void;
+  onBigMarket: () => void;
+}) {
+  return (
+    <section className="flow-controls panel" aria-label="Random order flow controls">
+      <div className="flow-title"><Activity size={14} /><span>random order flow</span><span className={`flow-status ${running ? 'active' : ''}`}><span className="pulse-dot" />{running ? 'running' : 'paused'}</span></div>
+      <button data-testid="button-flow-toggle" className={`flow-toggle ${running ? 'pause' : ''}`} onClick={() => onRunningChange(!running)}>
+        {running ? <Pause size={12} /> : <Play size={12} />} {running ? 'Pause' : 'Start'}
+      </button>
+      <label className="range-control"><span>speed <strong>{speed} / sec</strong></span><input data-testid="input-flow-speed" type="range" min="1" max="20" step="1" value={speed} onChange={(event) => onSpeedChange(Number(event.target.value))} /></label>
+      <label className="range-control"><span>aggression <strong>{aggression}%</strong></span><input data-testid="input-flow-aggression" type="range" min="0" max="100" step="1" value={aggression} onChange={(event) => onAggressionChange(Number(event.target.value))} /></label>
+      <button data-testid="button-big-market-order" className="big-market-button" onClick={onBigMarket}><Zap size={12} /> Buy 2,000 MKT</button>
+    </section>
+  );
+}
+
 function OrderEntry({
   side,
   kind,
@@ -276,7 +463,7 @@ function DepthRow({ order, cumulative, maxCumulative }: { order: Order; cumulati
   );
 }
 
-function BookLadder({ book }: { book: BookState }) {
+function BookLadder({ book, tradePrices }: { book: BookState; tradePrices: number[] }) {
   const asks = useMemo(() => [...book.asks].sort((a, b) => b.price - a.price).slice(0, 10), [book.asks]);
   const bids = useMemo(() => [...book.bids].sort((a, b) => b.price - a.price).slice(0, 10), [book.bids]);
   const askTotal = asks.reduce((sum, order) => sum + order.quantity, 0);
@@ -293,6 +480,7 @@ function BookLadder({ book }: { book: BookState }) {
         <div className="panel-title"><BookOpen size={14} /> price ladder</div>
         <div className="book-toolbar"><span>10 × 10</span><span className="mono">USD</span></div>
       </div>
+      <PriceChart prices={tradePrices} />
       <div className="book-head"><span>Price</span><span>Size</span><span>Cum. depth</span></div>
       <div className="book-side" aria-label="Ask orders">
         {asks.length ? (() => {
@@ -356,11 +544,11 @@ function TradeTape({ trades }: { trades: Trade[] }) {
 function OpenOrders({ book, onCancel }: { book: BookState; onCancel: (id: string) => void }) {
   const orders = [...book.bids, ...book.asks].sort((a, b) => b.sequence - a.sequence);
   return (
-    <section className="panel orders-section" aria-label="Open orders">
-      <div className="panel-heading">
+    <details className="panel orders-section">
+      <summary className="panel-heading">
         <div className="panel-title"><Layers3 size={14} /> open orders</div>
         <span className="panel-note mono">{orders.length} resting</span>
-      </div>
+      </summary>
       {orders.length ? <div style={{ overflowX: 'auto' }}>
         <table className="orders-table">
           <thead><tr><th>ID</th><th>Side</th><th>Price</th><th>Qty</th><th /></tr></thead>
@@ -373,7 +561,7 @@ function OpenOrders({ book, onCancel }: { book: BookState; onCancel: (id: string
           </tr>)}</tbody>
         </table>
       </div> : <div className="empty-state"><div className="empty-icon"><CircleAlert size={15} /></div><p>No resting orders</p><small>Limit orders that do not cross will appear here.</small></div>}
-    </section>
+    </details>
   );
 }
 
@@ -384,6 +572,9 @@ function App() {
   const [price, setPrice] = useState('100.25');
   const [quantity, setQuantity] = useState('10');
   const [cancelId, setCancelId] = useState('');
+  const [flowRunning, setFlowRunning] = useState(false);
+  const [flowSpeed, setFlowSpeed] = useState(8);
+  const [aggression, setAggression] = useState(45);
   const [toast, setToast] = useState<{ text: string; tone?: 'warn' | 'error' } | null>(null);
 
   useEffect(() => {
@@ -391,6 +582,30 @@ function App() {
     const timeout = window.setTimeout(() => setToast(null), 3000);
     return () => window.clearTimeout(timeout);
   }, [toast]);
+
+  useEffect(() => {
+    if (!flowRunning) return;
+    const interval = window.setInterval(() => {
+      setBook((current) => {
+        const incomingSide: Side = Math.random() < 0.5 ? 'buy' : 'sell';
+        const incomingQuantity = randomQuantity(10, 300);
+        const isMarket = Math.random() * 100 < aggression;
+        let next = isMarket
+          ? addMarketOrder(current, incomingSide, incomingQuantity).book
+          : addLimitOrder(current, incomingSide, randomLimitPrice(current, incomingSide), incomingQuantity).book;
+
+        if (Math.random() < 0.2) {
+          const restingOrders = [...next.bids, ...next.asks];
+          if (restingOrders.length) {
+            const target = restingOrders[Math.floor(Math.random() * restingOrders.length)];
+            next = cancelOrder(next, target.id).book;
+          }
+        }
+        return ensureLiquidity(next);
+      });
+    }, 1000 / flowSpeed);
+    return () => window.clearInterval(interval);
+  }, [aggression, flowRunning, flowSpeed]);
 
   const submitOrder = () => {
     const numericQuantity = Number(quantity);
@@ -421,6 +636,17 @@ function App() {
     setToast({ text: 'Book cleared. Ready for orders.', tone: 'warn' });
   };
 
+  const bigMarketOrder = () => {
+    const result = addMarketOrder(book, 'buy', 2000);
+    setBook(result.book);
+    setToast({
+      text: result.cancelledQuantity
+        ? `BUY 2,000 @ MKT · ${result.filledQuantity} filled · ${quantityText(result.cancelledQuantity)} cancelled`
+        : `BUY 2,000 @ MKT · ${result.fillCount} fills`,
+      tone: result.cancelledQuantity ? 'warn' : undefined,
+    });
+  };
+
   const cancel = (id = cancelId) => {
     if (!id.trim()) {
       setToast({ text: 'Enter an order ID to cancel.', tone: 'error' });
@@ -435,6 +661,8 @@ function App() {
     setCancelId('');
     setToast({ text: `${result.cancelled.id} cancelled.` });
   };
+
+  const tradePrices = useMemo(() => book.trades.slice(0, 200).reverse().map((trade) => trade.price), [book.trades]);
 
   return (
     <div className="terminal-shell">
@@ -455,9 +683,11 @@ function App() {
           <div><div className="eyebrow">Training venue / XNAS-SIM</div><h1 className="page-title">Limit order book</h1><p className="page-caption">Watch price-time priority resolve in real time. Every fill uses the resting order's price.</p></div>
           <div className="session-meta"><span><Clock3 size={12} /> session</span><strong className="mono">SIM–01</strong><span className="mono">USD / units</span></div>
         </div>
+        <MetricsStrip book={book} />
+        <FlowControls running={flowRunning} speed={flowSpeed} aggression={aggression} onRunningChange={setFlowRunning} onSpeedChange={setFlowSpeed} onAggressionChange={setAggression} onBigMarket={bigMarketOrder} />
         <div className="grid-layout">
           <OrderEntry side={side} kind={kind} price={price} quantity={quantity} onSideChange={setSide} onKindChange={setKind} onPriceChange={setPrice} onQuantityChange={setQuantity} onSubmit={submitOrder} onSeed={seed} onClear={clear} onCancel={() => cancel()} cancelId={cancelId} setCancelId={setCancelId} />
-          <BookLadder book={book} />
+          <BookLadder book={book} tradePrices={tradePrices} />
           <TradeTape trades={book.trades} />
         </div>
         <OpenOrders book={book} onCancel={cancel} />
