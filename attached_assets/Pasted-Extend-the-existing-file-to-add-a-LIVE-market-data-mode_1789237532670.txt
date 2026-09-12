@@ -1,0 +1,39 @@
+Extend the existing file to add a LIVE market data mode. Do NOT delete or rewrite the
+simulator or the matching engine — add alongside them.
+
+MODE TOGGLE
+- Add a "Sim / Live" toggle in the control bar. Default is Sim. Switching to Live
+  pauses the random order flow and clears the book; switching back to Sim disconnects
+  the socket and reseeds the simulated book.
+- Show a connection status dot next to the toggle: grey = disconnected, yellow =
+  connecting, green = live, red = error, with the text status beside it.
+
+LIVE FEED (Kraken public WebSocket, no API key, no auth)
+- Connect to wss://ws.kraken.com/v2
+- On open, send:
+  {"method":"subscribe","params":{"channel":"book","symbol":["BTC/USD"],"depth":10,"snapshot":true}}
+  and
+  {"method":"subscribe","params":{"channel":"trade","symbol":["BTC/USD"]}}
+- Book messages arrive as {"channel":"book","type":"snapshot"|"update","data":[{"symbol",
+  "bids":[{"price","qty"}],"asks":[{"price","qty"}]}]}
+  - On "snapshot": replace the whole book with those levels.
+  - On "update": for each level, set that price to the given qty; if qty is 0, DELETE
+    that price level. After applying, truncate each side back to 10 levels.
+- Trade messages arrive as {"channel":"trade","type":"update","data":[{"price","qty",
+  "side","timestamp"}]}. Push each into the existing trade tape and price chart.
+- Ignore messages with "method" or "channel":"heartbeat" or "status".
+- Add a symbol dropdown: BTC/USD, ETH/USD, SOL/USD. Changing it unsubscribes, clears
+  the book, and resubscribes.
+- Handle errors: on socket close or error, set status red and auto-retry after 3
+  seconds, max 3 attempts, then show "Live feed unavailable — switch to Sim".
+
+PAPER TRADING AGAINST THE LIVE BOOK
+- In Live mode the order entry form still works, but user orders never go to the
+  exchange. A user market order sweeps the live book levels locally and prints fills
+  to the tape marked "YOU" in cyan.
+- Track a position panel: net position, average entry price, realized PnL, and
+  unrealized PnL marked to the current mid. Update unrealized PnL on every book tick.
+- Add a "Flatten" button that sends an offsetting market order to bring position to 0.
+
+Keep the same dark theme, ladder, chart, and metrics strip. The ladder should render
+identically whether the data came from the simulator or the live feed.

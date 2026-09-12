@@ -30,6 +30,7 @@ type Order = {
   quantity: number;
   sequence: number;
   createdAt: number;
+  source?: 'live' | 'paper';
 };
 
 type Trade = {
@@ -38,6 +39,7 @@ type Trade = {
   quantity: number;
   aggressor: Side;
   timestamp: number;
+  source?: 'live' | 'you';
 };
 
 type BookState = {
@@ -56,6 +58,14 @@ type MatchResult = {
   restingId?: string;
   cancelledQuantity: number;
   message: string;
+};
+
+type AppMode = 'sim' | 'live';
+type LiveStatus = 'disconnected' | 'connecting' | 'live' | 'error';
+type PositionState = {
+  quantity: number;
+  averageEntryPrice: number;
+  realizedPnl: number;
 };
 
 const now = () => Date.now();
@@ -232,6 +242,232 @@ function randomLimitPrice(book: BookState, side: Side) {
   return Number(Math.max(0.01, reference + offset * 0.01).toFixed(2));
 }
 
+function liveOrderId(symbol: string, side: Side, price: number) {
+  return `L-${symbol.replace('/', '')}-${side}-${price.toFixed(8)}`;
+}
+
+function createLiveOrder(symbol: string, side: Side, price: number, quantity: number, sequence: number): Order {
+  return {
+    id: liveOrderId(symbol, side, price),
+    side,
+    type: 'limit',
+    price,
+    quantity,
+    sequence,
+    createdAt: now(),
+    source: 'live',
+  };
+}
+
+function liveOrdersFromLevels(
+  symbol: string,
+  side: Side,
+  levels: Array<{ price?: string | number; qty?: string | number }>,
+  startingSequence: number,
+) {
+  return levels
+    .map((level, index) => {
+      const price = Number(level.price);
+      const quantity = Number(level.qty);
+      return Number.isFinite(price) && price > 0 && Number.isFinite(quantity) && quantity > 0
+        ? createLiveOrder(symbol, side, price, quantity, startingSequence + index)
+        : undefined;
+    })
+    .filter((order): order is Order => Boolean(order));
+}
+
+function applyLiveBookMessage(
+  book: BookState,
+  symbol: string,
+  type: 'snapshot' | 'update',
+  data: Array<{
+    bids?: Array<{ price?: string | number; qty?: string | number }>;
+    asks?: Array<{ price?: string | number; qty?: string | number }>;
+  }>,
+) {
+  const payload = data[0];
+  if (!payload) return book;
+  const paperBids = book.bids.filter((order) => order.source !== 'live');
+  const paperAsks = book.asks.filter((order) => order.source !== 'live');
+  const liveBids = book.bids.filter((order) => order.source === 'live');
+  const liveAsks = book.asks.filter((order) => order.source === 'live');
+
+  if (type === 'snapshot') {
+    return {
+      ...book,
+      bids: sortBook('buy', [...paperBids, ...liveOrdersFromLevels(symbol, 'buy', payload.bids ?? [], book.nextSequence).slice(0, 10)]),
+      asks: sortBook('sell', [...paperAsks, ...liveOrdersFromLevels(symbol, 'sell', payload.asks ?? [], book.nextSequence + 10).slice(0, 10)]),
+      nextSequence: book.nextSequence + 20,
+    };
+  }
+
+  const applyUpdates = (
+    existing: Order[],
+    levels: Array<{ price?: string | number; qty?: string | number }>,
+    side: Side,
+  ) => {
+    const byPrice = new Map(existing.map((order) => [order.price.toFixed(8), order]));
+    levels.forEach((level, index) => {
+      const price = Number(level.price);
+      const quantity = Number(level.qty);
+      if (!Number.isFinite(price) || price <= 0 || !Number.isFinite(quantity)) return;
+      const key = price.toFixed(8);
+      if (quantity <= 0) {
+        byPrice.delete(key);
+      } else {
+        byPrice.set(key, createLiveOrder(symbol, side, price, quantity, book.nextSequence + index));
+      }
+    });
+    return [...byPrice.values()];
+  };
+
+  const nextBids = applyUpdates(liveBids, payload.bids ?? [], 'buy').sort((a, b) => b.price - a.price).slice(0, 10);
+  const nextAsks = applyUpdates(liveAsks, payload.asks ?? [], 'sell').sort((a, b) => a.price - b.price).slice(0, 10);
+  return {
+    ...book,
+    bids: sortBook('buy', [...paperBids, ...nextBids]),
+    asks: sortBook('sell', [...paperAsks, ...nextAsks]),
+    nextSequence: book.nextSequence + 20,
+  };
+}
+
+function appendLiveTrades(
+  book: BookState,
+  data: Array<{ price?: string | number; qty?: string | number; side?: string; timestamp?: string }>,
+) {
+  let next = { ...book, trades: [...book.trades] };
+  data.forEach((trade) => {
+    const price = Number(trade.price);
+    const quantity = Number(trade.qty);
+    if (!Number.isFinite(price) || !Number.isFinite(quantity) || price <= 0 || quantity <= 0) return;
+    const aggressor: Side = trade.side === 'sell' ? 'sell' : 'buy';
+    const timestamp = trade.timestamp ? Date.parse(trade.timestamp) : now();
+    next.trades.unshift({
+      id: `T-${String(next.nextTradeId).padStart(4, '0')}`,
+      price,
+      quantity,
+      aggressor,
+      timestamp: Number.isFinite(timestamp) ? timestamp : now(),
+      source: 'live',
+    });
+    next.nextTradeId += 1;
+  });
+  return next;
+}
+
+type PaperMatchResult = MatchResult & { fills: Trade[] };
+
+function markPaperMatch(result: MatchResult): PaperMatchResult {
+  const fills = result.book.trades.slice(0, result.fillCount).map((trade) => ({ ...trade, source: 'you' as const }));
+  const paperTrades = result.book.trades.map((trade, index) => (index < result.fillCount ? { ...trade, source: 'you' as const } : trade));
+  const markResting = (order: Order) => order.id === result.restingId ? { ...order, source: 'paper' as const } : order;
+  return {
+    ...result,
+    fills,
+    book: {
+      ...result.book,
+      trades: paperTrades,
+      bids: result.book.bids.map(markResting),
+      asks: result.book.asks.map(markResting),
+    },
+  };
+}
+
+function sweepLiveBook(book: BookState, side: Side, quantity: number): PaperMatchResult {
+  const next: BookState = {
+    ...book,
+    bids: [...book.bids],
+    asks: [...book.asks],
+    trades: [...book.trades],
+    nextTradeId: book.nextTradeId,
+  };
+  const opposingSide = side === 'buy' ? 'asks' : 'bids';
+  const opposing = sortBook(side === 'buy' ? 'sell' : 'buy', next[opposingSide].filter((order) => order.source === 'live'));
+  const consumed = new Map<string, number>();
+  const fills: Trade[] = [];
+  let remaining = quantity;
+  let filledQuantity = 0;
+
+  for (const resting of opposing) {
+    if (remaining <= 0) break;
+    const fill = Math.min(remaining, resting.quantity);
+    remaining -= fill;
+    filledQuantity += fill;
+    consumed.set(resting.id, resting.quantity - fill);
+    const trade: Trade = {
+      id: `T-${String(next.nextTradeId).padStart(4, '0')}`,
+      price: resting.price,
+      quantity: fill,
+      aggressor: side,
+      timestamp: now(),
+      source: 'you',
+    };
+    next.nextTradeId += 1;
+    next.trades.unshift(trade);
+    fills.push(trade);
+  }
+
+  next[opposingSide] = sortBook(side === 'buy' ? 'sell' : 'buy', next[opposingSide].flatMap((order) => {
+    if (!consumed.has(order.id)) return [order];
+    const remainingAtLevel = consumed.get(order.id) ?? 0;
+    return remainingAtLevel > 0 ? [{ ...order, quantity: remainingAtLevel }] : [];
+  }));
+
+  return {
+    book: next,
+    filledQuantity,
+    fillCount: fills.length,
+    cancelledQuantity: remaining,
+    message: `${side === 'buy' ? 'BUY' : 'SELL'} ${quantityText(quantity)} @ MKT · ${fills.length ? `${fills.length} fill${fills.length === 1 ? '' : 's'}` : 'no liquidity'}`,
+    fills,
+  };
+}
+
+function applyPositionFills(position: PositionState, fills: Trade[]): PositionState {
+  const next = { ...position };
+  fills.forEach((fill) => {
+    const quantity = fill.quantity;
+    const price = fill.price;
+    if (fill.aggressor === 'buy') {
+      if (next.quantity >= 0) {
+        next.averageEntryPrice = next.quantity + quantity > 0
+          ? ((next.averageEntryPrice * next.quantity) + price * quantity) / (next.quantity + quantity)
+          : 0;
+        next.quantity += quantity;
+      } else {
+        const closing = Math.min(-next.quantity, quantity);
+        next.realizedPnl += (next.averageEntryPrice - price) * closing;
+        const remaining = quantity - closing;
+        next.quantity += closing;
+        if (remaining > 0) {
+          next.quantity = remaining;
+          next.averageEntryPrice = price;
+        } else if (next.quantity === 0) {
+          next.averageEntryPrice = 0;
+        }
+      }
+    } else if (next.quantity <= 0) {
+      const shortSize = Math.abs(next.quantity);
+      next.averageEntryPrice = shortSize + quantity > 0
+        ? ((next.averageEntryPrice * shortSize) + price * quantity) / (shortSize + quantity)
+        : 0;
+      next.quantity -= quantity;
+    } else {
+      const closing = Math.min(next.quantity, quantity);
+      next.realizedPnl += (price - next.averageEntryPrice) * closing;
+      const remaining = quantity - closing;
+      next.quantity -= closing;
+      if (remaining > 0) {
+        next.quantity = -remaining;
+        next.averageEntryPrice = price;
+      } else if (next.quantity === 0) {
+        next.averageEntryPrice = 0;
+      }
+    }
+  });
+  return next;
+}
+
 function PriceChart({ prices }: { prices: number[] }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -340,37 +576,95 @@ function MetricsStrip({ book }: { book: BookState }) {
   );
 }
 
+function pnlText(value: number | undefined) {
+  if (value === undefined || !Number.isFinite(value)) return '—';
+  return `${value >= 0 ? '+' : ''}${money(value)}`;
+}
+
+function PositionPanel({
+  position,
+  midpoint,
+  onFlatten,
+}: {
+  position: PositionState;
+  midpoint?: number;
+  onFlatten: () => void;
+}) {
+  const unrealizedPnl = position.quantity && midpoint !== undefined
+    ? (midpoint - position.averageEntryPrice) * position.quantity
+    : position.quantity ? undefined : 0;
+  return (
+    <section className="position-panel" aria-label="Paper position">
+      <div className="position-heading"><span>paper position</span><span className="live-label"><span className="pulse-dot" />live book</span></div>
+      <div className="position-grid">
+        <div><span>net position</span><strong className={position.quantity > 0 ? 'bid-text' : position.quantity < 0 ? 'ask-text' : ''}>{quantityText(position.quantity)}</strong></div>
+        <div><span>avg entry</span><strong>{position.quantity ? money(position.averageEntryPrice) : '—'}</strong></div>
+        <div><span>realized pnl</span><strong className={position.realizedPnl >= 0 ? 'bid-text' : 'ask-text'}>{pnlText(position.realizedPnl)}</strong></div>
+        <div><span>unrealized pnl</span><strong className={unrealizedPnl === undefined || unrealizedPnl >= 0 ? 'bid-text' : 'ask-text'}>{pnlText(unrealizedPnl)}</strong></div>
+      </div>
+      <button data-testid="button-flatten-position" className="flatten-button" onClick={onFlatten} disabled={!position.quantity}>Flatten position</button>
+    </section>
+  );
+}
+
 function FlowControls({
+  mode,
+  liveStatus,
+  liveStatusText,
+  symbol,
   running,
   speed,
   aggression,
+  onModeChange,
+  onSymbolChange,
   onRunningChange,
   onSpeedChange,
   onAggressionChange,
   onBigMarket,
 }: {
+  mode: AppMode;
+  liveStatus: LiveStatus;
+  liveStatusText: string;
+  symbol: string;
   running: boolean;
   speed: number;
   aggression: number;
+  onModeChange: (mode: AppMode) => void;
+  onSymbolChange: (symbol: string) => void;
   onRunningChange: (running: boolean) => void;
   onSpeedChange: (speed: number) => void;
   onAggressionChange: (aggression: number) => void;
   onBigMarket: () => void;
 }) {
   return (
-    <section className="flow-controls panel" aria-label="Random order flow controls">
-      <div className="flow-title"><Activity size={14} /><span>random order flow</span><span className={`flow-status ${running ? 'active' : ''}`}><span className="pulse-dot" />{running ? 'running' : 'paused'}</span></div>
-      <button data-testid="button-flow-toggle" className={`flow-toggle ${running ? 'pause' : ''}`} onClick={() => onRunningChange(!running)}>
-        {running ? <Pause size={12} /> : <Play size={12} />} {running ? 'Pause' : 'Start'}
-      </button>
-      <label className="range-control"><span>speed <strong>{speed} / sec</strong></span><input data-testid="input-flow-speed" type="range" min="1" max="20" step="1" value={speed} onChange={(event) => onSpeedChange(Number(event.target.value))} /></label>
-      <label className="range-control"><span>aggression <strong>{aggression}%</strong></span><input data-testid="input-flow-aggression" type="range" min="0" max="100" step="1" value={aggression} onChange={(event) => onAggressionChange(Number(event.target.value))} /></label>
+    <section className={`flow-controls panel ${mode === 'live' ? 'live-controls' : ''}`} aria-label="Market mode and order flow controls">
+      <div className="mode-control">
+        <div className="mode-toggle" role="group" aria-label="Market data mode">
+          <button data-testid="button-mode-sim" className={`mode-button ${mode === 'sim' ? 'active' : ''}`} onClick={() => onModeChange('sim')}>Sim</button>
+          <button data-testid="button-mode-live" className={`mode-button ${mode === 'live' ? 'active live' : ''}`} onClick={() => onModeChange('live')}>Live</button>
+        </div>
+        <div className={`connection-status ${liveStatus}`}><span className="connection-dot" />{liveStatusText}</div>
+        {mode === 'live' && <select data-testid="select-live-symbol" className="symbol-select" value={symbol} onChange={(event) => onSymbolChange(event.target.value)} aria-label="Live market symbol">
+          {['BTC/USD', 'ETH/USD', 'SOL/USD'].map((option) => <option key={option} value={option}>{option}</option>)}
+        </select>}
+      </div>
+      {mode === 'sim' ? <>
+        <div className="flow-title"><Activity size={14} /><span>random order flow</span><span className={`flow-status ${running ? 'active' : ''}`}><span className="pulse-dot" />{running ? 'running' : 'paused'}</span></div>
+        <button data-testid="button-flow-toggle" className={`flow-toggle ${running ? 'pause' : ''}`} onClick={() => onRunningChange(!running)}>
+          {running ? <Pause size={12} /> : <Play size={12} />} {running ? 'Pause' : 'Start'}
+        </button>
+        <label className="range-control"><span>speed <strong>{speed} / sec</strong></span><input data-testid="input-flow-speed" type="range" min="1" max="20" step="1" value={speed} onChange={(event) => onSpeedChange(Number(event.target.value))} /></label>
+        <label className="range-control"><span>aggression <strong>{aggression}%</strong></span><input data-testid="input-flow-aggression" type="range" min="0" max="100" step="1" value={aggression} onChange={(event) => onAggressionChange(Number(event.target.value))} /></label>
+      </> : <div className="live-context"><Activity size={14} /><span>paper trading against live book</span></div>}
       <button data-testid="button-big-market-order" className="big-market-button" onClick={onBigMarket}><Zap size={12} /> Buy 2,000 MKT</button>
     </section>
   );
 }
 
 function OrderEntry({
+  mode,
+  position,
+  midpoint,
   side,
   kind,
   price,
@@ -383,9 +677,13 @@ function OrderEntry({
   onSeed,
   onClear,
   onCancel,
+  onFlatten,
   cancelId,
   setCancelId,
 }: {
+  mode: AppMode;
+  position: PositionState;
+  midpoint?: number;
   side: Side;
   kind: OrderKind;
   price: string;
@@ -398,6 +696,7 @@ function OrderEntry({
   onSeed: () => void;
   onClear: () => void;
   onCancel: () => void;
+  onFlatten: () => void;
   cancelId: string;
   setCancelId: (value: string) => void;
 }) {
@@ -405,7 +704,7 @@ function OrderEntry({
     <section className="panel order-panel" aria-label="Order entry">
       <div className="panel-heading">
         <div className="panel-title"><SlidersHorizontal size={14} /> order entry</div>
-        <span className="panel-note mono">LOCAL SIM</span>
+        <span className="panel-note mono">{mode === 'live' ? 'LIVE / PAPER' : 'LOCAL SIM'}</span>
       </div>
       <div className="panel-block">
         <div className="segmented">
@@ -429,17 +728,17 @@ function OrderEntry({
         </div>
         <button data-testid="button-submit-order" className={`submit-button ${side}`} onClick={onSubmit}>
           {side === 'buy' ? <ArrowDownToLine size={14} /> : <ArrowUpFromLine size={14} />}
-          Submit {side} {kind}
+          Submit {side} {kind}{mode === 'live' ? ' paper' : ''}
         </button>
-        <p className="micro-copy"><CircleHelp size={12} /> Orders execute immediately when they cross. Resting orders follow FIFO time priority.</p>
+        <p className="micro-copy"><CircleHelp size={12} /> {mode === 'live' ? 'Paper orders stay local and never reach the exchange.' : 'Orders execute immediately when they cross. Resting orders follow FIFO time priority.'}</p>
       </div>
-      <div className="panel-block">
+      {mode === 'sim' ? <div className="panel-block">
         <div className="field-label"><span>Book controls</span><span className="live-label"><span className="pulse-dot" /> live</span></div>
         <div className="control-row">
           <button data-testid="button-seed-book" className="control-button" onClick={onSeed}><Play size={12} /> Seed book</button>
           <button data-testid="button-clear-book" className="control-button danger" onClick={onClear}><Trash2 size={12} /> Clear</button>
         </div>
-      </div>
+      </div> : <PositionPanel position={position} midpoint={midpoint} onFlatten={onFlatten} />}
       <div className="panel-block">
         <div className="field-label"><span>Cancel by order ID</span><span className="field-hint">resting only</span></div>
         <div className="cancel-wrap">
@@ -530,8 +829,8 @@ function TradeTape({ trades }: { trades: Trade[] }) {
       </div>
       {trades.length ? <div className="tape-list">
         {trades.slice(0, 24).map((trade) => (
-          <div className={`tape-row ${trade.aggressor === 'buy' ? 'tape-buy' : 'tape-sell'}`} key={trade.id} data-testid={`row-trade-${trade.id}`}>
-            <div><div className="tape-price">{money(trade.price)}</div><div className="tape-side">{trade.aggressor} aggressor</div></div>
+          <div className={`tape-row ${trade.source === 'you' ? 'tape-you' : trade.aggressor === 'buy' ? 'tape-buy' : 'tape-sell'}`} key={trade.id} data-testid={`row-trade-${trade.id}`}>
+            <div><div className="tape-price">{money(trade.price)}</div><div className="tape-side">{trade.source === 'you' ? 'YOU' : `${trade.aggressor} aggressor`}</div></div>
             <div className="tape-qty">{quantityText(trade.quantity)} units</div>
             <div className="tape-time">{new Date(trade.timestamp).toLocaleTimeString([], { minute: '2-digit', second: '2-digit' })}</div>
           </div>
@@ -541,8 +840,10 @@ function TradeTape({ trades }: { trades: Trade[] }) {
   );
 }
 
-function OpenOrders({ book, onCancel }: { book: BookState; onCancel: (id: string) => void }) {
-  const orders = [...book.bids, ...book.asks].sort((a, b) => b.sequence - a.sequence);
+function OpenOrders({ book, mode, onCancel }: { book: BookState; mode: AppMode; onCancel: (id: string) => void }) {
+  const orders = [...book.bids, ...book.asks]
+    .filter((order) => mode === 'sim' || order.source !== 'live')
+    .sort((a, b) => b.sequence - a.sequence);
   return (
     <details className="panel orders-section">
       <summary className="panel-heading">
@@ -567,6 +868,11 @@ function OpenOrders({ book, onCancel }: { book: BookState; onCancel: (id: string
 
 function App() {
   const [book, setBook] = useState<BookState>(() => seedBook());
+  const [mode, setMode] = useState<AppMode>('sim');
+  const [symbol, setSymbol] = useState('BTC/USD');
+  const [liveStatus, setLiveStatus] = useState<LiveStatus>('disconnected');
+  const [liveStatusText, setLiveStatusText] = useState('disconnected');
+  const [position, setPosition] = useState<PositionState>({ quantity: 0, averageEntryPrice: 0, realizedPnl: 0 });
   const [side, setSide] = useState<Side>('buy');
   const [kind, setKind] = useState<OrderKind>('limit');
   const [price, setPrice] = useState('100.25');
@@ -576,6 +882,7 @@ function App() {
   const [flowSpeed, setFlowSpeed] = useState(8);
   const [aggression, setAggression] = useState(45);
   const [toast, setToast] = useState<{ text: string; tone?: 'warn' | 'error' } | null>(null);
+  const liveSocketRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     if (!toast) return;
@@ -584,7 +891,7 @@ function App() {
   }, [toast]);
 
   useEffect(() => {
-    if (!flowRunning) return;
+    if (!flowRunning || mode !== 'sim') return;
     const interval = window.setInterval(() => {
       setBook((current) => {
         const incomingSide: Side = Math.random() < 0.5 ? 'buy' : 'sell';
@@ -605,7 +912,134 @@ function App() {
       });
     }, 1000 / flowSpeed);
     return () => window.clearInterval(interval);
-  }, [aggression, flowRunning, flowSpeed]);
+  }, [aggression, flowRunning, flowSpeed, mode]);
+
+  useEffect(() => {
+    if (mode !== 'live') {
+      setLiveStatus('disconnected');
+      setLiveStatusText('disconnected');
+      return;
+    }
+
+    let cancelled = false;
+    let retryTimer: number | undefined;
+    let attempts = 0;
+    let socket: WebSocket | undefined;
+
+    const setConnection = (status: LiveStatus, text: string) => {
+      if (cancelled) return;
+      setLiveStatus(status);
+      setLiveStatusText(text);
+    };
+
+    const subscribe = () => {
+      socket?.send(JSON.stringify({
+        method: 'subscribe',
+        params: { channel: 'book', symbol: [symbol], depth: 10, snapshot: true },
+      }));
+      socket?.send(JSON.stringify({
+        method: 'subscribe',
+        params: { channel: 'trade', symbol: [symbol] },
+      }));
+    };
+
+    const connect = () => {
+      if (cancelled) return;
+      attempts += 1;
+      setConnection('connecting', attempts === 1 ? 'connecting' : `retry ${attempts}/3`);
+      socket = new WebSocket('wss://ws.kraken.com/v2');
+      liveSocketRef.current = socket;
+
+      socket.onopen = () => {
+        attempts = 0;
+        setConnection('live', 'live');
+        subscribe();
+      };
+
+      socket.onmessage = (event) => {
+        if (cancelled) return;
+        try {
+          const message = JSON.parse(event.data as string) as {
+            channel?: string;
+            type?: string;
+            data?: Array<{
+              symbol?: string;
+              bids?: Array<{ price?: string | number; qty?: string | number }>;
+              asks?: Array<{ price?: string | number; qty?: string | number }>;
+              price?: string | number;
+              qty?: string | number;
+              side?: string;
+              timestamp?: string;
+            }>;
+          };
+          if (!message.channel || message.channel === 'heartbeat' || message.channel === 'status' || 'method' in message) return;
+          if (message.channel === 'book' && (message.type === 'snapshot' || message.type === 'update')) {
+            setBook((current) => applyLiveBookMessage(current, symbol, message.type as 'snapshot' | 'update', message.data ?? []));
+          } else if (message.channel === 'trade' && message.type === 'update') {
+            setBook((current) => appendLiveTrades(current, message.data ?? []));
+          }
+        } catch {
+          setConnection('error', 'invalid feed message');
+        }
+      };
+
+      socket.onerror = () => {
+        setConnection('error', 'connection error');
+      };
+
+      socket.onclose = () => {
+        if (cancelled) return;
+        liveSocketRef.current = null;
+        if (attempts < 3) {
+          setConnection('error', `reconnecting (${attempts}/3)`);
+          retryTimer = window.setTimeout(connect, 3000);
+        } else {
+          setConnection('error', 'Live feed unavailable — switch to Sim');
+        }
+      };
+    };
+
+    setBook(blankBook());
+    setConnection('connecting', 'connecting');
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ method: 'unsubscribe', params: { channel: 'book', symbol: [symbol], depth: 10 } }));
+        socket.send(JSON.stringify({ method: 'unsubscribe', params: { channel: 'trade', symbol: [symbol] } }));
+      }
+      socket?.close();
+      if (liveSocketRef.current === socket) liveSocketRef.current = null;
+    };
+  }, [mode, symbol]);
+
+  const changeMode = (nextMode: AppMode) => {
+    if (nextMode === mode) return;
+    setFlowRunning(false);
+    if (nextMode === 'live') {
+      setBook(blankBook());
+      setLiveStatus('connecting');
+      setLiveStatusText('connecting');
+      setMode('live');
+      setToast({ text: `Connecting to Kraken ${symbol} live data.` });
+    } else {
+      setBook(seedBook());
+      setLiveStatus('disconnected');
+      setLiveStatusText('disconnected');
+      setMode('sim');
+      setToast({ text: 'Live feed disconnected. Simulated book reseeded.' });
+    }
+  };
+
+  const changeSymbol = (nextSymbol: string) => {
+    setBook(blankBook());
+    setLiveStatus('connecting');
+    setLiveStatusText('connecting');
+    setSymbol(nextSymbol);
+    setToast({ text: `Switching live feed to ${nextSymbol}.` });
+  };
 
   const submitOrder = () => {
     const numericQuantity = Number(quantity);
@@ -618,10 +1052,17 @@ function App() {
       setToast({ text: 'Enter a valid limit price.', tone: 'error' });
       return;
     }
-    const result = kind === 'limit'
-      ? addLimitOrder(book, side, numericPrice, numericQuantity)
-      : addMarketOrder(book, side, numericQuantity);
+    const result = mode === 'live'
+      ? kind === 'limit'
+        ? markPaperMatch(addLimitOrder(book, side, numericPrice, numericQuantity))
+        : sweepLiveBook(book, side, numericQuantity)
+      : kind === 'limit'
+        ? addLimitOrder(book, side, numericPrice, numericQuantity)
+        : addMarketOrder(book, side, numericQuantity);
     setBook(result.book);
+    if (mode === 'live') {
+      setPosition((current) => applyPositionFills(current, (result as PaperMatchResult).fills));
+    }
     setToast({ text: result.cancelledQuantity ? `${result.message} · ${quantityText(result.cancelledQuantity)} cancelled` : result.message, tone: result.cancelledQuantity ? 'warn' : undefined });
     setQuantity('10');
   };
@@ -637,12 +1078,27 @@ function App() {
   };
 
   const bigMarketOrder = () => {
-    const result = addMarketOrder(book, 'buy', 2000);
+    const result = mode === 'live' ? sweepLiveBook(book, 'buy', 2000) : addMarketOrder(book, 'buy', 2000);
     setBook(result.book);
+    if (mode === 'live') setPosition((current) => applyPositionFills(current, (result as PaperMatchResult).fills));
     setToast({
       text: result.cancelledQuantity
         ? `BUY 2,000 @ MKT · ${result.filledQuantity} filled · ${quantityText(result.cancelledQuantity)} cancelled`
         : `BUY 2,000 @ MKT · ${result.fillCount} fills`,
+      tone: result.cancelledQuantity ? 'warn' : undefined,
+    });
+  };
+
+  const flatten = () => {
+    if (mode !== 'live' || !position.quantity) return;
+    const flattenSide: Side = position.quantity > 0 ? 'sell' : 'buy';
+    const result = sweepLiveBook(book, flattenSide, Math.abs(position.quantity));
+    setBook(result.book);
+    setPosition((current) => applyPositionFills(current, result.fills));
+    setToast({
+      text: result.cancelledQuantity
+        ? `Flattened ${result.filledQuantity} · ${quantityText(result.cancelledQuantity)} still open`
+        : `Position flattened with ${result.fillCount} fill${result.fillCount === 1 ? '' : 's'}.`,
       tone: result.cancelledQuantity ? 'warn' : undefined,
     });
   };
@@ -663,6 +1119,7 @@ function App() {
   };
 
   const tradePrices = useMemo(() => book.trades.slice(0, 200).reverse().map((trade) => trade.price), [book.trades]);
+  const midpoint = getBookTop(book).midpoint;
 
   return (
     <div className="terminal-shell">
@@ -671,26 +1128,26 @@ function App() {
           <div className="brand-glyph"><BarChart3 size={16} /></div>
           <div><div className="brand-name">Market / Lab</div><div className="brand-sub">microstructure simulator</div></div>
         </div>
-        <div className="market-badge"><span className="pulse-dot" /> matching engine online</div>
+        <div className={`market-badge ${mode === 'live' ? `status-${liveStatus}` : ''}`}><span className={mode === 'live' ? 'connection-dot' : 'pulse-dot'} /> {mode === 'live' ? liveStatusText : 'matching engine online'}</div>
         <div className="top-actions">
           <button data-testid="button-help" className="icon-button" title="Simulator guide" onClick={() => setToast({ text: 'Crossing orders trade at the resting price; equal prices fill FIFO.' })}><CircleHelp size={16} /></button>
-          <button data-testid="button-reset-session" className="icon-button" title="Reset session" onClick={seed}><RotateCcw size={16} /></button>
+          <button data-testid="button-reset-session" className="icon-button" title="Reset session" onClick={() => mode === 'live' ? changeMode('sim') : seed()}><RotateCcw size={16} /></button>
           <ShieldCheck size={15} color="hsl(140 62% 65%)" />
         </div>
       </header>
       <main className="workspace">
         <div className="workspace-heading">
-          <div><div className="eyebrow">Training venue / XNAS-SIM</div><h1 className="page-title">Limit order book</h1><p className="page-caption">Watch price-time priority resolve in real time. Every fill uses the resting order's price.</p></div>
-          <div className="session-meta"><span><Clock3 size={12} /> session</span><strong className="mono">SIM–01</strong><span className="mono">USD / units</span></div>
+          <div><div className="eyebrow">{mode === 'live' ? `Live market / Kraken · ${symbol}` : 'Training venue / XNAS-SIM'}</div><h1 className="page-title">Limit order book</h1><p className="page-caption">{mode === 'live' ? 'Public market data with local paper execution. No orders are sent to the exchange.' : 'Watch price-time priority resolve in real time. Every fill uses the resting order\'s price.'}</p></div>
+          <div className="session-meta"><span><Clock3 size={12} /> session</span><strong className="mono">{mode === 'live' ? 'LIVE–01' : 'SIM–01'}</strong><span className="mono">{mode === 'live' ? symbol : 'USD / units'}</span></div>
         </div>
         <MetricsStrip book={book} />
-        <FlowControls running={flowRunning} speed={flowSpeed} aggression={aggression} onRunningChange={setFlowRunning} onSpeedChange={setFlowSpeed} onAggressionChange={setAggression} onBigMarket={bigMarketOrder} />
+        <FlowControls mode={mode} liveStatus={liveStatus} liveStatusText={liveStatusText} symbol={symbol} running={flowRunning} speed={flowSpeed} aggression={aggression} onModeChange={changeMode} onSymbolChange={changeSymbol} onRunningChange={setFlowRunning} onSpeedChange={setFlowSpeed} onAggressionChange={setAggression} onBigMarket={bigMarketOrder} />
         <div className="grid-layout">
-          <OrderEntry side={side} kind={kind} price={price} quantity={quantity} onSideChange={setSide} onKindChange={setKind} onPriceChange={setPrice} onQuantityChange={setQuantity} onSubmit={submitOrder} onSeed={seed} onClear={clear} onCancel={() => cancel()} cancelId={cancelId} setCancelId={setCancelId} />
+          <OrderEntry mode={mode} position={position} midpoint={midpoint} side={side} kind={kind} price={price} quantity={quantity} onSideChange={setSide} onKindChange={setKind} onPriceChange={setPrice} onQuantityChange={setQuantity} onSubmit={submitOrder} onSeed={seed} onClear={clear} onCancel={() => cancel()} onFlatten={flatten} cancelId={cancelId} setCancelId={setCancelId} />
           <BookLadder book={book} tradePrices={tradePrices} />
           <TradeTape trades={book.trades} />
         </div>
-        <OpenOrders book={book} onCancel={cancel} />
+        <OpenOrders book={book} mode={mode} onCancel={cancel} />
       </main>
       {toast && <div className={`toast-message ${toast.tone ?? ''}`} role="status" data-testid="status-toast">{toast.text}</div>}
     </div>
